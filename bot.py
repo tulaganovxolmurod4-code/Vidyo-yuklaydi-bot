@@ -1,8 +1,10 @@
 import os
 import logging
 import sqlite3
+import subprocess
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 import asyncio
 
@@ -53,7 +55,6 @@ async def start_cmd(message: types.Message):
 # --- ADMIN PANEL (/admin) ---
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
-    # Faqat siz yozgandagina ishlaydi
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -100,15 +101,19 @@ async def download_video(message: types.Message):
 
     processing_msg = await message.answer(f"{platform}dan video yuklab olinmoqda, kuting... ⏳")
 
-    output_template = f"downloads/{message.from_user.id}_%(id)s.%(ext)s"
     os.makedirs("downloads", exist_ok=True)
+    output_template = f"downloads/{message.from_user.id}_%(id)s.%(ext)s"
 
+    # Bloklanishga qarshi optimizatsiya qilingan sozlamalar
     ydl_opts = {
         'outtmpl': output_template,
         'format': 'best[ext=mp4]/best',
         'noplaylist': True,
-        'extractor-args': 'youtube:player_client=ios,web',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'extractor-args': 'youtube:player_client=android,web',
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 30,
     }
 
     try:
@@ -118,18 +123,63 @@ async def download_video(message: types.Message):
 
         if os.path.exists(filename):
             video_file = types.FSInputFile(filename)
+            
+            # Dumaloq video qilish uchun tugma qo'shamiz
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔴 Dumaloq video qilish", callback_data=f"round_{filename}")]
+            ])
+
             await message.answer_video(
                 video=video_file,
-                caption="✅ Marhamat, siz so'ragan video!"
+                caption="✅ Marhamat, siz so'ragan video!",
+                reply_markup=keyboard
             )
             await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
-            os.remove(filename)
         else:
             await processing_msg.edit_text("❌ Videoni yuklab bo'lmadi. Havola yopiq yoki mavjud emas.")
 
     except Exception as e:
         logging.error(f"Xatolik: {e}")
         await processing_msg.edit_text("❌ Xatolik yuz berdi. Havolaning ochiqligiga ishonch hosil qiling.")
+
+# --- DUMALOQ VIDEOGA AYLANTIRISH ---
+@dp.callback_query(F.data.startswith("round_"))
+async def make_round_video(callback: types.CallbackQuery):
+    file_path = callback.data.replace("round_", "", 1)
+    
+    if not os.path.exists(file_path):
+        await callback.answer("❌ Video fayli topilmadi yoki eskirgan!", show_alert=True)
+        return
+
+    await callback.answer("⏳ Video dumaloq formatga o'tkazilmoqda...")
+    
+    round_filename = file_path.replace(".mp4", "_round.mp4")
+    
+    # FFmpeg yordamida videoni kvadrat shaklga keltirish va dumaloq formatga moslash
+    cmd = [
+        'ffmpeg', '-y', '-i', file_path,
+        '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=360:360',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k',
+        round_filename
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if os.path.exists(round_filename):
+            video_note = types.FSInputFile(round_filename)
+            await callback.message.answer_video_note(video=video_note)
+            
+            # Vaqtincha fayllarni o'chirish
+            os.remove(file_path)
+            os.remove(round_filename)
+        else:
+            await callback.message.answer("❌ Videoni dumaloq qilishda xatolik yuz berdi.")
+            
+    except Exception as e:
+        logging.error(f"FFmpeg xatolik: {e}")
+        await callback.message.answer("❌ Konvertatsiya qilishda xatolik yuz berdi.")
 
 async def main():
     await dp.start_polling(bot)
