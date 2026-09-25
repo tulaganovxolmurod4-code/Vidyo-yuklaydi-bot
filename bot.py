@@ -104,7 +104,7 @@ async def download_video(message: types.Message):
     os.makedirs("downloads", exist_ok=True)
     output_template = f"downloads/{message.from_user.id}_%(id)s.%(ext)s"
 
-    # Bloklanishga qarshi optimizatsiya qilingan sozlamalar
+    # Bloklanishga qarshi va Proxy qo'llab-quvvatlaydigan sozlamalar
     ydl_opts = {
         'outtmpl': output_template,
         'format': 'best[ext=mp4]/best',
@@ -114,6 +114,7 @@ async def download_video(message: types.Message):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'socket_timeout': 30,
+        # 'proxy': 'http://foydalanuvchi:parol@ip_manzil:port',  <-- Proksi ishlatmoqchi bo'lsangiz shu yerdagi '#' belgisini olib tashlang va o'z proksingizni yozing
     }
 
     try:
@@ -124,7 +125,7 @@ async def download_video(message: types.Message):
         if os.path.exists(filename):
             video_file = types.FSInputFile(filename)
             
-            # Dumaloq video qilish uchun tugma qo'shamiz
+            # Dumaloq video qilish uchun tugma
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔴 Dumaloq video qilish", callback_data=f"round_{filename}")]
             ])
@@ -155,7 +156,6 @@ async def make_round_video(callback: types.CallbackQuery):
     
     round_filename = file_path.replace(".mp4", "_round.mp4")
     
-    # FFmpeg yordamida videoni kvadrat shaklga keltirish va dumaloq formatga moslash
     cmd = [
         'ffmpeg', '-y', '-i', file_path,
         '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=360:360',
@@ -171,7 +171,6 @@ async def make_round_video(callback: types.CallbackQuery):
             video_note = types.FSInputFile(round_filename)
             await callback.message.answer_video_note(video=video_note)
             
-            # Vaqtincha fayllarni o'chirish
             os.remove(file_path)
             os.remove(round_filename)
         else:
