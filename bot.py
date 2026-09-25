@@ -104,7 +104,6 @@ async def download_video(message: types.Message):
     os.makedirs("downloads", exist_ok=True)
     output_template = f"downloads/{message.from_user.id}_%(id)s.%(ext)s"
 
-    # Bloklanishga qarshi va Proxy qo'llab-quvvatlaydigan sozlamalar
     ydl_opts = {
         'outtmpl': output_template,
         'format': 'best[ext=mp4]/best',
@@ -114,7 +113,6 @@ async def download_video(message: types.Message):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'socket_timeout': 30,
-        # 'proxy': 'http://foydalanuvchi:parol@ip_manzil:port',  <-- Proksi ishlatmoqchi bo'lsangiz shu yerdagi '#' belgisini olib tashlang va o'z proksingizni yozing
     }
 
     try:
@@ -125,7 +123,6 @@ async def download_video(message: types.Message):
         if os.path.exists(filename):
             video_file = types.FSInputFile(filename)
             
-            # Dumaloq video qilish uchun tugma
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔴 Dumaloq video qilish", callback_data=f"round_{filename}")]
             ])
@@ -181,6 +178,8 @@ async def make_round_video(callback: types.CallbackQuery):
         await callback.message.answer("❌ Konvertatsiya qilishda xatolik yuz berdi.")
 
 async def main():
+    # Konfliktni oldini olish uchun webhook tozalanmoqda
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
