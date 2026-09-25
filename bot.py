@@ -158,7 +158,6 @@ async def make_round_video(callback: types.CallbackQuery):
     
     round_filename = file_path.replace(".mp4", "_round.mp4")
     
-    # Render'da xatolik bermaydigan tozalangan FFmpeg buyrug'i
     cmd = [
         'ffmpeg', '-y', '-i', file_path,
         '-vf', 'scale=360:360:force_original_aspect_ratio=increase,crop=360:360',
@@ -168,7 +167,8 @@ async def make_round_video(callback: types.CallbackQuery):
     ]
     
     try:
-        subprocess.run(cmd, check=Test := True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Xatolik keltirib chiqargan joy to'g'irlandi (check=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         if os.path.exists(round_filename):
             video_note = types.FSInputFile(round_filename)
