@@ -2,6 +2,7 @@ import os
 import logging
 import sqlite3
 import subprocess
+from aiohttp import web  # <-- Veb-server uchun qo'shildi
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,7 +11,7 @@ import asyncio
 
 # --- SOZLAMALAR ---
 TOKEN = "8737473852:AAEPeZ4GFGf1HrYt3sxdXWf817C7Bf6hTDA"
-ADMIN_ID = 8490356906  # Sizning Telegram ID raqamingiz
+ADMIN_ID = 8490356906
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -177,9 +178,23 @@ async def make_round_video(callback: types.CallbackQuery):
         logging.error(f"FFmpeg xatolik: {e}")
         await callback.message.answer("❌ Konvertatsiya qilishda xatolik yuz berdi.")
 
+# --- RENDER UCHUN PORT OCHUVCHI SERVER ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
-    # Konfliktni oldini olish uchun webhook tozalanmoqda
     await bot.delete_webhook(drop_pending_updates=True)
+    # Veb-serverni va bot pollingni birga ishga tushiramiz
+    await web_server()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
