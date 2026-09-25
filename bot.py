@@ -124,8 +124,11 @@ async def download_video(message: types.Message):
         if os.path.exists(filename):
             video_file = types.FSInputFile(filename)
             
+            # Fayl nomining faqat o'zini qirqib olamiz (callback_data 64 baytdan oshib ketmasligi uchun)
+            filename_short = os.path.basename(filename)
+            
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔴 Dumaloq video qilish", callback_data=f"round_{filename}")]
+                [InlineKeyboardButton(text="🔴 Dumaloq video qilish", callback_data=f"round_{filename_short}")]
             ])
 
             await message.answer_video(
@@ -144,7 +147,8 @@ async def download_video(message: types.Message):
 # --- DUMALOQ VIDEOGA AYLANTIRISH ---
 @dp.callback_query(F.data.startswith("round_"))
 async def make_round_video(callback: types.CallbackQuery):
-    file_path = callback.data.replace("round_", "", 1)
+    file_name = callback.data.replace("round_", "", 1)
+    file_path = os.path.join("downloads", file_name)
     
     if not os.path.exists(file_path):
         await callback.answer("❌ Video fayli topilmadi yoki eskirgan!", show_alert=True)
@@ -169,8 +173,10 @@ async def make_round_video(callback: types.CallbackQuery):
             video_note = types.FSInputFile(round_filename)
             await callback.message.answer_video_note(video=video_note)
             
-            os.remove(file_path)
-            os.remove(round_filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            if os.path.exists(round_filename):
+                os.remove(round_filename)
         else:
             await callback.message.answer("❌ Videoni dumaloq qilishda xatolik yuz berdi.")
             
