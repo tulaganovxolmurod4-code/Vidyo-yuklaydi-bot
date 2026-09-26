@@ -10,8 +10,11 @@ import yt_dlp
 import asyncio
 
 # --- SOZLAMALAR ---
-TOKEN = "8737473852:AAEPeZ4GFGf1HrYt3sxdXWf817C7Bf6hTDA"
-ADMIN_ID = 8490356906
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable topilmadi! Uni sozlab qo'ying.")
+
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8490356906"))
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -124,7 +127,6 @@ async def download_video(message: types.Message):
         if os.path.exists(filename):
             video_file = types.FSInputFile(filename)
             
-            # Fayl nomining faqat o'zini qirqib olamiz (callback_data 64 baytdan oshib ketmasligi uchun)
             filename_short = os.path.basename(filename)
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -167,7 +169,6 @@ async def make_round_video(callback: types.CallbackQuery):
     ]
     
     try:
-        # Xatolik keltirib chiqargan joy to'g'irlandi (check=True)
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         if os.path.exists(round_filename):
@@ -200,7 +201,6 @@ async def web_server():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # Veb-serverni va bot pollingni birga ishga tushiramiz
     await web_server()
     await dp.start_polling(bot)
 
