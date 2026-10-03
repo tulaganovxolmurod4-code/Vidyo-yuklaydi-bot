@@ -23,6 +23,7 @@ MAX_ROUND_PARTS = 3          # dumaloq video: 3 ta bo'lakkacha (3 x 60 s)
 ROUND_SIZE = 384             # 384 = tiniq. Tezroq kerak bo'lsa 320, yanada tiniq kerak bo'lsa 480
 ROUND_CRF = 23               # kichik son = sifatliroq (18-28 oralig'ida), katta = tezroq
 FILE_LIFETIME = 20 * 60      # yuklangan videolar 20 daqiqadan keyin o'chiriladi
+MAX_UPLOAD_MB = 20           # Telegram botlar uchun yuklab olish chegarasi
 ffmpeg_slots = asyncio.Semaphore(1)  # bittadan ishlasin: birinchi bo'lak tezroq chiqadi
 
 logging.basicConfig(level=logging.INFO)
@@ -136,7 +137,8 @@ async def start_cmd(message: types.Message):
     await message.answer(
         "Assalomu alaykum! 👋\n\n"
         "Men Instagram, TikTok va YouTube videolarini yuklab beruvchi mutlaqo bepul botman.\n\n"
-        "Marhamat, menga video havolasini yuboring! 📥"
+        "Marhamat, menga video havolasini yuboring! 📥\n\n"
+        "Yoki galereyadagi videoni yuboring, uni dumaloq video yoki MP3 qilib beraman. 🔴"
     )
 
 # --- ADMIN PANEL (/admin) ---
@@ -167,7 +169,43 @@ async def admin_panel(message: types.Message):
 
     await message.answer(text, parse_mode="Markdown")
 
-# --- VIDEO YUKLASH QISMI ---
+# --- GALEREYADAN YUBORILGAN VIDEO ---
+@dp.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
+async def handle_user_video(message: types.Message):
+    user = message.from_user
+    add_user(user.id, user.full_name, user.username)
+
+    media = message.video or message.document
+
+    if media.file_size and media.file_size > MAX_UPLOAD_MB * 1024 * 1024:
+        await message.answer(
+            f"❌ Video hajmi {MAX_UPLOAD_MB} MB dan katta. "
+            f"Telegram botlarga katta fayl yuklashga ruxsat bermaydi. "
+            f"Qisqaroq yoki kichikroq video yuboring."
+        )
+        return
+
+    os.makedirs("downloads", exist_ok=True)
+    filename_short = f"{user.id}_{uuid.uuid4().hex[:8]}.mp4"
+    path = os.path.join("downloads", filename_short)
+
+    wait_msg = await message.answer("⏳ Video qabul qilinmoqda...")
+    try:
+        await bot.download(media, destination=path)
+        await message.answer(
+            "✅ Video qabul qilindi. Nima qilay?",
+            reply_markup=make_keyboard(filename_short)
+        )
+    except Exception as e:
+        logging.error(f"Video qabul qilishda xatolik: {e}")
+        await message.answer("❌ Videoni qabul qilib bo'lmadi, qayta urinib ko'ring.")
+    finally:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+# --- VIDEO YUKLASH QISMI (havola) ---
 @dp.message(F.text.regexp(r'https?://[^\s]+'))
 async def download_video(message: types.Message):
     user = message.from_user
