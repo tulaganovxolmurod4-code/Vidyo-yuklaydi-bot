@@ -51,14 +51,17 @@ db_connect()
 
 # --- YORDAMCHI FUNKSIYALAR ---
 async def run_ffmpeg(*args: str) -> bool:
-    """ffmpeg ni botni qotirmasdan ishga tushiradi."""
+    """ffmpeg ni botni qotirmasdan ishga tushiradi, xatoni logga yozadi."""
     async with ffmpeg_slots:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", *args,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-        return await proc.wait() == 0
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            logging.error("FFMPEG XATO: " + err.decode(errors="ignore")[-800:])
+        return proc.returncode == 0
 
 
 def remove_files(paths):
@@ -225,7 +228,7 @@ async def media_action(callback: types.CallbackQuery):
             ok = await run_ffmpeg(
                 "-i", file_path, "-t", "10", "-an",
                 "-vf", "scale=480:-2", "-pix_fmt", "yuv420p",
-                "-c:v", "libx264", out
+                "-c:v", "libx264", "-preset", "ultrafast", out
             )
             if ok and os.path.exists(out):
                 await callback.message.answer_animation(types.FSInputFile(out))
@@ -241,12 +244,14 @@ async def media_action(callback: types.CallbackQuery):
                 "-i", file_path,
                 "-filter_complex", f"[0:v]setpts={v}*PTS[v];[0:a]atempo={a}[a]",
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", out
             )
             if not ok:  # videoda ovoz bo'lmasa
                 ok = await run_ffmpeg(
                     "-i", file_path, "-an", "-vf", f"setpts={v}*PTS",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", out
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", out
                 )
             if ok and os.path.exists(out):
                 await callback.message.answer_video(types.FSInputFile(out))
@@ -260,7 +265,7 @@ async def media_action(callback: types.CallbackQuery):
                 "-i", file_path,
                 "-t", str(60 * MAX_ROUND_PARTS),
                 "-vf", "scale=360:360:force_original_aspect_ratio=increase,crop=360:360",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
                 "-force_key_frames", "expr:gte(t,n_forced*60)",
                 "-f", "segment", "-segment_time", "60",
