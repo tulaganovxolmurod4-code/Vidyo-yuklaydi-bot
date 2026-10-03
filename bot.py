@@ -155,8 +155,11 @@ async def touch_user(user: types.User):
 
 
 def user_line(name, username, uid) -> str:
+    safe_name = html.escape(name or "Noma'lum")
     uname = f"@{html.escape(username)}" if username else "username yo'q"
-    return f'• <a href="tg://user?id={uid}">{html.escape(name or "Noma\'lum")}</a> | {uname} | <code>{uid}</code>'
+    return f'• <a href="tg://user?id={uid}">{safe_name}</a> | {uname} | <code>{uid}</code>'
+    
+
 
 # --- YORDAMCHI FUNKSIYALAR ---
 async def run_ffmpeg(*args: str) -> bool:
