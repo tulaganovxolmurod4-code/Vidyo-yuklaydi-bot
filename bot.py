@@ -1,6 +1,8 @@
 import os
 import glob
+import math
 import time
+import uuid
 import logging
 import sqlite3
 from aiohttp import web  # Veb-server uchun
@@ -18,8 +20,9 @@ if not TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8490356906"))
 
 MAX_ROUND_PARTS = 3          # dumaloq video: 3 ta bo'lakkacha (3 x 60 s)
+ROUND_SIZE = 240             # kichikroq = tezroq (sifat kerak bo'lsa 320)
 FILE_LIFETIME = 20 * 60      # yuklangan videolar 20 daqiqadan keyin o'chiriladi
-ffmpeg_slots = asyncio.Semaphore(2)  # bir vaqtda 2 ta ffmpeg ishi (Render uchun)
+ffmpeg_slots = asyncio.Semaphore(1)  # bittadan ishlasin: birinchi bo'lak tezroq chiqadi
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -64,6 +67,33 @@ async def run_ffmpeg(*args: str) -> bool:
         return proc.returncode == 0
 
 
+async def get_duration(path: str) -> float:
+    """Video uzunligini soniyada qaytaradi."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    try:
+        return float(out.decode().strip())
+    except ValueError:
+        return 0.0
+
+
+async def make_round_part(src: str, out: str, start: int) -> bool:
+    """Videoning 60 soniyalik bo'lagini dumaloq (kvadrat) formatga o'tkazadi."""
+    s = ROUND_SIZE
+    return await run_ffmpeg(
+        "-ss", str(start), "-i", src, "-t", "60",
+        "-vf", f"fps=20,scale={s}:{s}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={s}:{s}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "33", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+        out
+    )
+
+
 def remove_files(paths):
     for p in paths:
         try:
@@ -77,12 +107,7 @@ def make_keyboard(filename_short: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🎵 MP3", callback_data=f"mp3_{filename_short}"),
-            InlineKeyboardButton(text="🎞 GIF", callback_data=f"gif_{filename_short}"),
-        ],
-        [InlineKeyboardButton(text="🔴 Dumaloq video", callback_data=f"round_{filename_short}")],
-        [
-            InlineKeyboardButton(text="⏩ 2x tez", callback_data=f"fast_{filename_short}"),
-            InlineKeyboardButton(text="🐢 0.5x sekin", callback_data=f"slow_{filename_short}"),
+            InlineKeyboardButton(text="🔴 Dumaloq video", callback_data=f"round_{filename_short}"),
         ],
     ])
 
@@ -196,8 +221,8 @@ async def download_video(message: types.Message):
         logging.error(f"Xatolik: {e}")
         await processing_msg.edit_text("❌ Xatolik yuz berdi. Havolaning ochiqligiga ishonch hosil qiling.")
 
-# --- TUGMALAR: MP3 / GIF / TEZLIK / DUMALOQ ---
-@dp.callback_query(F.data.regexp(r"^(mp3|gif|fast|slow|round)_"))
+# --- TUGMALAR: MP3 / DUMALOQ ---
+@dp.callback_query(F.data.regexp(r"^(mp3|round)_"))
 async def media_action(callback: types.CallbackQuery):
     action, file_name = callback.data.split("_", 1)
     file_path = os.path.join("downloads", os.path.basename(file_name))
@@ -208,12 +233,13 @@ async def media_action(callback: types.CallbackQuery):
 
     await callback.answer("⏳ Qayta ishlanmoqda...")
     base = os.path.splitext(file_path)[0]
+    uid = uuid.uuid4().hex[:6]   # har bir ish uchun noyob nom (to'qnashuv bo'lmasin)
     outputs = []
 
     try:
         # --- MP3 ---
         if action == "mp3":
-            out = f"{base}_audio.mp3"
+            out = f"{base}_{uid}.mp3"
             outputs.append(out)
             ok = await run_ffmpeg("-i", file_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", out)
             if ok and os.path.exists(out):
@@ -221,65 +247,27 @@ async def media_action(callback: types.CallbackQuery):
             else:
                 await callback.message.answer("❌ Audio ajratib bo'lmadi (videoda ovoz bo'lmasligi mumkin).")
 
-        # --- GIF (birinchi 10 soniya) ---
-        elif action == "gif":
-            out = f"{base}_gif.mp4"
-            outputs.append(out)
-            ok = await run_ffmpeg(
-                "-i", file_path, "-t", "10", "-an",
-                "-vf", "scale=480:-2", "-pix_fmt", "yuv420p",
-                "-c:v", "libx264", "-preset", "ultrafast", out
-            )
-            if ok and os.path.exists(out):
-                await callback.message.answer_animation(types.FSInputFile(out))
-            else:
-                await callback.message.answer("❌ GIF qilib bo'lmadi.")
-
-        # --- TEZLIK: 2x yoki 0.5x ---
-        elif action in ("fast", "slow"):
-            out = f"{base}_{action}.mp4"
-            outputs.append(out)
-            v, a = ("0.5", "2.0") if action == "fast" else ("2.0", "0.5")
-            ok = await run_ffmpeg(
-                "-i", file_path,
-                "-filter_complex", f"[0:v]setpts={v}*PTS[v];[0:a]atempo={a}[a]",
-                "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", out
-            )
-            if not ok:  # videoda ovoz bo'lmasa
-                ok = await run_ffmpeg(
-                    "-i", file_path, "-an", "-vf", f"setpts={v}*PTS",
-                    "-c:v", "libx264", "-preset", "ultrafast",
-                    "-pix_fmt", "yuv420p", out
-                )
-            if ok and os.path.exists(out):
-                await callback.message.answer_video(types.FSInputFile(out))
-            else:
-                await callback.message.answer("❌ Tezlikni o'zgartirib bo'lmadi.")
-
         # --- DUMALOQ VIDEO (60 soniyadan oshsa bo'laklarga bo'linadi) ---
         elif action == "round":
-            pattern = f"{base}_round_%02d.mp4"
-            ok = await run_ffmpeg(
-                "-i", file_path,
-                "-t", str(60 * MAX_ROUND_PARTS),
-                "-vf", "scale=360:360:force_original_aspect_ratio=increase,crop=360:360",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                "-force_key_frames", "expr:gte(t,n_forced*60)",
-                "-f", "segment", "-segment_time", "60",
-                "-reset_timestamps", "1",
-                pattern
-            )
-            outputs = sorted(glob.glob(f"{base}_round_*.mp4"))
-            if not ok or not outputs:
-                await callback.message.answer("❌ Videoni dumaloq qilishda xatolik yuz berdi.")
-            else:
-                if len(outputs) > 1:
-                    await callback.message.answer(f"⭕ Video {len(outputs)} ta bo'lakka bo'lindi, yuborilmoqda...")
-                for p in outputs:  # ketma-ket yuboriladi
-                    await callback.message.answer_video_note(video_note=types.FSInputFile(p))
+            duration = await get_duration(file_path)
+            parts = max(1, min(MAX_ROUND_PARTS, math.ceil(duration / 60))) if duration else 1
+            outs = [f"{base}_{uid}_r{i}.mp4" for i in range(parts)]
+            outputs.extend(outs)
+
+            if parts > 1:
+                await callback.message.answer(f"⭕ Video {parts} ta bo'lakka bo'linadi, tayyor bo'lgani yuboriladi...")
+
+            # bo'laklar navbat bilan tayyorlanadi, tayyor bo'lgani darrov yuboriladi
+            tasks = [asyncio.create_task(make_round_part(file_path, outs[i], i * 60))
+                     for i in range(parts)]
+
+            for i, task in enumerate(tasks):
+                ok = await task
+                if ok and os.path.exists(outs[i]) and os.path.getsize(outs[i]) > 1000:
+                    await callback.message.answer_video_note(video_note=types.FSInputFile(outs[i]))
+                else:
+                    await callback.message.answer("❌ Videoni dumaloq qilishda xatolik yuz berdi.")
+                    break
 
     except Exception as e:
         logging.error(f"FFmpeg xatolik: {e}")
