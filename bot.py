@@ -1,13 +1,17 @@
 import os
 import glob
+import html
 import math
 import time
 import uuid
 import logging
-import sqlite3
+import asyncpg
 from aiohttp import web  # Veb-server uchun
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, ChatMemberUpdatedFilter, KICKED, MEMBER
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 import asyncio
@@ -17,6 +21,10 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable topilmadi! Uni sozlab qo'ying.")
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable topilmadi! Supabase havolasini qo'ying.")
+
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8490356906"))
 
 MAX_ROUND_PARTS = 3          # dumaloq video: 3 ta bo'lakkacha (3 x 60 s)
@@ -24,35 +32,131 @@ ROUND_SIZE = 384             # 384 = tiniq. Tezroq kerak bo'lsa 320, yanada tini
 ROUND_CRF = 23               # kichik son = sifatliroq (18-28 oralig'ida), katta = tezroq
 FILE_LIFETIME = 20 * 60      # yuklangan videolar 20 daqiqadan keyin o'chiriladi
 MAX_UPLOAD_MB = 20           # Telegram botlar uchun yuklab olish chegarasi
+MAX_MISSED = 3               # qaytgan foydalanuvchiga ko'pi bilan nechta o'tkazib yuborilgan xabar yetkaziladi
 ffmpeg_slots = asyncio.Semaphore(1)  # bittadan ishlasin: birinchi bo'lak tezroq chiqadi
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- BAZANI YARATISH ---
-def db_connect():
-    conn = sqlite3.connect("bot_users.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT
+pool: asyncpg.Pool = None  # Supabase (Postgres) ulanishlar to'plami
+
+
+class Broadcast(StatesGroup):
+    waiting_message = State()
+    confirm = State()
+
+# --- BAZA (SUPABASE / POSTGRES) ---
+async def init_db():
+    global pool
+    pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0
+    )
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                full_name TEXT,
+                username TEXT
+            )
+        """)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                msg_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
+                broadcast_id INT NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (broadcast_id, user_id)
+            )
+        """)
+        # Supabase API orqali begona kirishni yopadi (bot to'g'ridan-to'g'ri ulangani uchun ishlayveradi)
+        for t in ("users", "broadcasts", "deliveries"):
+            await conn.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
+
+
+async def add_user(user_id, full_name, username):
+    try:
+        await pool.execute(
+            "INSERT INTO users (user_id, full_name, username) VALUES ($1, $2, $3) "
+            "ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, "
+            "username = EXCLUDED.username, is_blocked = FALSE, blocked_at = NULL",
+            user_id, full_name, username
         )
-    """)
-    conn.commit()
-    conn.close()
+    except Exception as e:
+        logging.error(f"Bazaga yozishda xato: {e}")
 
-def add_user(user_id, full_name, username):
-    conn = sqlite3.connect("bot_users.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, full_name, username) VALUES (?, ?, ?)",
-                   (user_id, full_name, username))
-    conn.commit()
-    conn.close()
 
-db_connect()
+async def set_blocked(user_id: int, blocked: bool):
+    try:
+        await pool.execute(
+            "UPDATE users SET is_blocked = $1, "
+            "blocked_at = CASE WHEN $1 THEN now() ELSE NULL END WHERE user_id = $2",
+            blocked, user_id
+        )
+    except Exception as e:
+        logging.error(f"Bloklash holatini yozishda xato: {e}")
+
+
+async def get_all_users():
+    return await pool.fetch(
+        "SELECT user_id, full_name, username FROM users ORDER BY joined_at, user_id"
+    )
+
+
+async def deliver_missed(user_id: int):
+    """Foydalanuvchi qaytganda, unga yetmagan oxirgi xabarlarni yetkazadi."""
+    try:
+        rows = await pool.fetch(
+            """
+            UPDATE deliveries d SET status = 'sent'
+            FROM broadcasts b
+            WHERE d.broadcast_id = b.id AND d.user_id = $1 AND d.status <> 'sent'
+              AND d.broadcast_id IN (
+                  SELECT broadcast_id FROM deliveries
+                  WHERE user_id = $1 AND status <> 'sent'
+                  ORDER BY broadcast_id DESC LIMIT $2
+              )
+            RETURNING d.broadcast_id, b.chat_id, b.msg_id
+            """,
+            user_id, MAX_MISSED
+        )
+    except Exception as e:
+        logging.error(f"Yetkazilmagan xabarlarni olishda xato: {e}")
+        return
+
+    for r in sorted(rows, key=lambda x: x["broadcast_id"]):
+        try:
+            await bot.copy_message(chat_id=user_id, from_chat_id=r["chat_id"], message_id=r["msg_id"])
+        except Exception as e:
+            logging.error(f"Yetkazilmagan xabarni yuborishda xato ({user_id}): {e}")
+            try:
+                await pool.execute(
+                    "UPDATE deliveries SET status = 'failed' WHERE broadcast_id = $1 AND user_id = $2",
+                    r["broadcast_id"], user_id
+                )
+            except Exception:
+                pass
+
+
+async def touch_user(user: types.User):
+    """Foydalanuvchini bazaga yozadi/yangilaydi va unga yetmagan xabarlarni yetkazadi."""
+    await add_user(user.id, user.full_name, user.username)
+    await deliver_missed(user.id)
+
+
+def user_line(name, username, uid) -> str:
+    uname = f"@{html.escape(username)}" if username else "username yo'q"
+    return f'• <a href="tg://user?id={uid}">{html.escape(name or "Noma\'lum")}</a> | {uname} | <code>{uid}</code>'
 
 # --- YORDAMCHI FUNKSIYALAR ---
 async def run_ffmpeg(*args: str) -> bool:
@@ -128,18 +232,26 @@ async def cleanup_loop():
             except OSError:
                 pass
 
+# --- BOT BLOKLANGANDA / BLOKDAN CHIQARILGANDA ---
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
+async def on_bot_blocked(event: types.ChatMemberUpdated):
+    await set_blocked(event.from_user.id, True)
+
+
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
+async def on_bot_unblocked(event: types.ChatMemberUpdated):
+    await touch_user(event.from_user)  # blokdan chiqqan: yetmagan xabarlar yetkaziladi
+
 # --- START BUYrug'i ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    user = message.from_user
-    add_user(user.id, user.full_name, user.username)
-
     await message.answer(
         "Assalomu alaykum! 👋\n\n"
         "Men Instagram, TikTok va YouTube videolarini yuklab beruvchi mutlaqo bepul botman.\n\n"
         "Marhamat, menga video havolasini yuboring! 📥\n\n"
         "Yoki galereyadagi videoni yuboring, uni dumaloq video yoki MP3 qilib beraman. 🔴"
     )
+    await touch_user(message.from_user)
 
 # --- ADMIN PANEL (/admin) ---
 @dp.message(Command("admin"))
@@ -147,33 +259,185 @@ async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    conn = sqlite3.connect("bot_users.db")
-    cursor = conn.cursor()
+    total_users = await pool.fetchval("SELECT COUNT(*) FROM users")
+    blocked_users = await pool.fetchval("SELECT COUNT(*) FROM users WHERE is_blocked")
+    recent_users = await pool.fetch(
+        "SELECT user_id, full_name, username FROM users ORDER BY joined_at DESC, user_id DESC LIMIT 20"
+    )
 
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-
-    cursor.execute("SELECT user_id, full_name, username FROM users ORDER BY user_id DESC LIMIT 20")
-    recent_users = cursor.fetchall()
-
-    conn.close()
-
-    text = f"📊 **Bot statistikasi:**\n\n"
-    text += f"👥 Jami foydalanuvchilar: **{total_users}** ta\n\n"
-    text += "👤 **Oxirgi kirgan foydalanuvchilar:**\n"
-
+    text = "📊 <b>Bot statistikasi:</b>\n\n"
+    text += f"👥 Jami foydalanuvchilar: <b>{total_users}</b> ta\n"
+    text += f"✅ Faol: <b>{total_users - blocked_users}</b> ta\n"
+    text += f"🚫 Botni bloklagan: <b>{blocked_users}</b> ta\n\n"
+    text += "👤 <b>Oxirgi kirgan foydalanuvchilar:</b>\n"
     for u in recent_users:
-        uid, name, uname = u
-        username_str = f"@{uname}" if uname else "Username yo'q"
-        text += f"• {name} | [{username_str}](tg://user?id={uid}) (`{uid}`)\n"
+        text += user_line(u["full_name"], u["username"], u["user_id"]) + "\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Hammaga xabar yuborish", callback_data="bc_start")],
+        [InlineKeyboardButton(text="🚫 Bloklaganlar ro'yxati", callback_data="bl_list")],
+    ])
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "bl_list")
+async def blocked_list(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    await callback.answer()
+
+    total = await pool.fetchval("SELECT COUNT(*) FROM users WHERE is_blocked")
+    rows = await pool.fetch(
+        "SELECT user_id, full_name, username FROM users WHERE is_blocked "
+        "ORDER BY blocked_at DESC NULLS LAST LIMIT 40"
+    )
+    if not rows:
+        await callback.message.answer("🚫 Botni bloklaganlar hozircha yo'q.")
+        return
+
+    text = f"🚫 <b>Botni bloklaganlar:</b> {total} ta\n\n"
+    for u in rows:
+        text += user_line(u["full_name"], u["username"], u["user_id"]) + "\n"
+    if total > len(rows):
+        text += f"\n... va yana {total - len(rows)} ta"
+    await callback.message.answer(text, parse_mode="HTML")
+
+# --- ADMIN: HAMMAGA XABAR YUBORISH (BROADCAST) ---
+# Muhim: bu bloklar video/havola handlerlaridan OLDIN turishi kerak.
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await message.answer("❌ Bekor qilindi.")
+
+
+@dp.callback_query(F.data == "bc_start")
+async def bc_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    await state.set_state(Broadcast.waiting_message)
+    await callback.message.answer(
+        "📢 Barcha foydalanuvchilarga yuboriladigan xabarni yozing.\n"
+        "Matn, rasm yoki video yuborishingiz mumkin.\n\n"
+        "⚠️ Yuborgan xabaringizni shu chatdan o'chirib yubormang, aks holda "
+        "yetmagan odamlarga keyin yetkazib bo'lmaydi.\n\n"
+        "Bekor qilish: /cancel"
+    )
+    await callback.answer()
+
+
+@dp.message(Broadcast.waiting_message)
+async def bc_receive(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(chat_id=message.chat.id, msg_id=message.message_id)
+    await state.set_state(Broadcast.confirm)
+
+    total = len(await get_all_users())
+    await message.answer("👆 Foydalanuvchilarga shu xabar yuboriladi (ko'rinishi shunday bo'ladi).")
+    await message.answer(
+        f"Jami <b>{total}</b> ta foydalanuvchiga yuborilsinmi?\n"
+        f"(Avval bloklaganlarga ham urinib ko'riladi.)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Yuborish", callback_data="bc_yes"),
+            InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc_no"),
+        ]])
+    )
+
+
+async def send_one(uid: int, from_chat: int, msg_id: int) -> str:
+    """'sent' / 'blocked' / 'failed' qaytaradi."""
+    for _ in range(2):
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=msg_id)
+            return "sent"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramForbiddenError:
+            return "blocked"  # foydalanuvchi botni bloklagan
+        except Exception as e:
+            logging.error(f"Broadcast xato ({uid}): {e}")
+            return "failed"
+    return "failed"
+
+
+@dp.callback_query(Broadcast.confirm, F.data.in_({"bc_yes", "bc_no"}))
+async def bc_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    if callback.data == "bc_no":
+        await callback.message.edit_text("❌ Bekor qilindi.")
+        await callback.answer()
+        return
+
+    await callback.answer()
+    await callback.message.edit_text("📤 Yuborilmoqda, kuting...")
+
+    bid = await pool.fetchval(
+        "INSERT INTO broadcasts (chat_id, msg_id) VALUES ($1, $2) RETURNING id",
+        data["chat_id"], data["msg_id"]
+    )
+
+    sent = blocked = failed = 0
+    unreached = []  # (user, sabab)
+
+    for u in await get_all_users():
+        uid = u["user_id"]
+        status = await send_one(uid, data["chat_id"], data["msg_id"])
+
+        if status == "sent":
+            sent += 1
+            await set_blocked(uid, False)
+        elif status == "blocked":
+            blocked += 1
+            await set_blocked(uid, True)
+            unreached.append((u, "bloklagan"))
+        else:
+            failed += 1
+            unreached.append((u, "xato"))
+
+        try:
+            await pool.execute(
+                "INSERT INTO deliveries (broadcast_id, user_id, status) VALUES ($1, $2, $3) "
+                "ON CONFLICT (broadcast_id, user_id) DO UPDATE SET status = EXCLUDED.status",
+                bid, uid, status
+            )
+        except Exception as e:
+            logging.error(f"Yetkazish holatini yozishda xato: {e}")
+
+        await asyncio.sleep(0.05)  # Telegram limitidan oshib ketmaslik uchun
+
+    text = (
+        "✅ <b>Xabar yuborish tugadi.</b>\n\n"
+        f"📬 Yetkazildi: <b>{sent}</b> ta\n"
+        f"🚫 Botni bloklagan (yetmadi): <b>{blocked}</b> ta\n"
+        f"⚠️ Boshqa xato: <b>{failed}</b> ta\n"
+    )
+    if unreached:
+        text += "\n<b>Yetib bormaganlar:</b>\n"
+        for u, reason in unreached[:30]:
+            text += user_line(u["full_name"], u["username"], u["user_id"]) + f" ({reason})\n"
+        if len(unreached) > 30:
+            text += f"... va yana {len(unreached) - 30} ta\n"
+        text += "\nBular botga qaytib kelganda, xabar ularga o'zi yetkaziladi."
+
+    await callback.message.answer(text, parse_mode="HTML")
 
 # --- GALEREYADAN YUBORILGAN VIDEO ---
 @dp.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
 async def handle_user_video(message: types.Message):
     user = message.from_user
-    add_user(user.id, user.full_name, user.username)
+    await touch_user(user)
 
     media = message.video or message.document
 
@@ -209,7 +473,7 @@ async def handle_user_video(message: types.Message):
 @dp.message(F.text.regexp(r'https?://[^\s]+'))
 async def download_video(message: types.Message):
     user = message.from_user
-    add_user(user.id, user.full_name, user.username)
+    await touch_user(user)
 
     url = message.text.strip()
 
@@ -339,10 +603,14 @@ async def web_server():
     await site.start()
 
 async def main():
+    await init_db()   # Supabase bazasiga ulanish va jadvallarni yaratish/yangilash
     await bot.delete_webhook(drop_pending_updates=True)
     await web_server()
     asyncio.create_task(cleanup_loop())
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
