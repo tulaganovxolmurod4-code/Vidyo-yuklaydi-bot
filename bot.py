@@ -20,7 +20,8 @@ if not TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8490356906"))
 
 MAX_ROUND_PARTS = 3          # dumaloq video: 3 ta bo'lakkacha (3 x 60 s)
-ROUND_SIZE = 240             # kichikroq = tezroq (sifat kerak bo'lsa 320)
+ROUND_SIZE = 384             # 384 = tiniq. Tezroq kerak bo'lsa 320, yanada tiniq kerak bo'lsa 480
+ROUND_CRF = 23               # kichik son = sifatliroq (18-28 oralig'ida), katta = tezroq
 FILE_LIFETIME = 20 * 60      # yuklangan videolar 20 daqiqadan keyin o'chiriladi
 ffmpeg_slots = asyncio.Semaphore(1)  # bittadan ishlasin: birinchi bo'lak tezroq chiqadi
 
@@ -87,9 +88,9 @@ async def make_round_part(src: str, out: str, start: int) -> bool:
     s = ROUND_SIZE
     return await run_ffmpeg(
         "-ss", str(start), "-i", src, "-t", "60",
-        "-vf", f"fps=20,scale={s}:{s}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={s}:{s}",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "33", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+        "-vf", f"fps=30,scale={s}:{s}:force_original_aspect_ratio=increase:flags=lanczos,crop={s}:{s}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(ROUND_CRF), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "1",
         out
     )
 
@@ -231,7 +232,13 @@ async def media_action(callback: types.CallbackQuery):
         await callback.answer("❌ Video fayli topilmadi yoki eskirgan! Havolani qayta yuboring.", show_alert=True)
         return
 
-    await callback.answer("⏳ Qayta ishlanmoqda...")
+    await callback.answer()  # tepadagi yozuvsiz, faqat tugma "aylanishi"ni to'xtatadi
+
+    # Pastda (chatda) "kuting" xabari chiqadi
+    wait_text = ("⏳ Iltimos kuting, dumaloq video qilinmoqda..."
+                 if action == "round" else "⏳ Iltimos kuting, MP3 tayyorlanmoqda...")
+    wait_msg = await callback.message.answer(wait_text)
+
     base = os.path.splitext(file_path)[0]
     uid = uuid.uuid4().hex[:6]   # har bir ish uchun noyob nom (to'qnashuv bo'lmasin)
     outputs = []
@@ -254,9 +261,6 @@ async def media_action(callback: types.CallbackQuery):
             outs = [f"{base}_{uid}_r{i}.mp4" for i in range(parts)]
             outputs.extend(outs)
 
-            if parts > 1:
-                await callback.message.answer(f"⭕ Video {parts} ta bo'lakka bo'linadi, tayyor bo'lgani yuboriladi...")
-
             # bo'laklar navbat bilan tayyorlanadi, tayyor bo'lgani darrov yuboriladi
             tasks = [asyncio.create_task(make_round_part(file_path, outs[i], i * 60))
                      for i in range(parts)]
@@ -274,6 +278,10 @@ async def media_action(callback: types.CallbackQuery):
         await callback.message.answer("❌ Konvertatsiya qilishda xatolik yuz berdi.")
     finally:
         remove_files(outputs)  # asl video qoladi, 20 daqiqadan keyin o'chiriladi
+        try:
+            await wait_msg.delete()  # "kuting" xabarini o'chiradi
+        except Exception:
+            pass
 
 # --- RENDER UCHUN PORT OCHUVCHI SERVER ---
 async def handle(request):
