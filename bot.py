@@ -120,7 +120,9 @@ async def cleanup_loop():
         now = time.time()
         for p in glob.glob("downloads/*"):
             try:
-                if now - os.path.getmtime(p) > FILE_LIFETIME:
+                # fayl vaqtining yangisini olamiz (asl video vaqti adashtirmasin)
+                age_time = max(os.path.getmtime(p), os.path.getctime(p))
+                if now - age_time > FILE_LIFETIME:
                     os.remove(p)
             except OSError:
                 pass
@@ -198,6 +200,7 @@ async def download_video(message: types.Message):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'socket_timeout': 30,
+        'updatetime': False,   # fayl vaqtini videoning asl vaqtiga o'zgartirmasin
     }
 
     try:
@@ -206,6 +209,7 @@ async def download_video(message: types.Message):
             filename = ydl.prepare_filename(info)
 
         if os.path.exists(filename):
+            os.utime(filename, None)  # fayl vaqtini hozirgiga yangilaydi
             video_file = types.FSInputFile(filename)
             filename_short = os.path.basename(filename)
 
