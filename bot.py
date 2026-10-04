@@ -7,7 +7,7 @@ import uuid
 import logging
 import asyncpg
 from aiohttp import web  # Veb-server uchun
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, ChatMemberUpdatedFilter, KICKED, MEMBER
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -40,6 +40,32 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 pool: asyncpg.Pool = None  # Supabase (Postgres) ulanishlar to'plami
+
+
+class DedupMiddleware(BaseMiddleware):
+    """Bir xabar ikki marta kelsa, ikkinchisini o'tkazib yuboradi."""
+
+    def __init__(self):
+        self.seen = {}
+
+    async def __call__(self, handler, event, data):
+        now = time.time()
+        # Diagnostika uchun: logda har bir xabarning raqami ko'rinadi
+        logging.info(
+            f"XABAR chat={event.chat.id} message_id={event.message_id} "
+            f"text={(event.text or event.caption or '')[:30]!r}"
+        )
+        if len(self.seen) > 500:
+            self.seen = {k: t for k, t in self.seen.items() if now - t < 60}
+        key = (event.chat.id, event.message_id)
+        if key in self.seen and now - self.seen[key] < 60:
+            logging.info(f"TAKROR xabar o'tkazib yuborildi: {key}")
+            return
+        self.seen[key] = now
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(DedupMiddleware())
 
 
 class Broadcast(StatesGroup):
@@ -158,7 +184,6 @@ def user_line(name, username, uid) -> str:
     safe_name = html.escape(name or "Noma'lum")
     uname = f"@{html.escape(username)}" if username else "username yo'q"
     return f'• <a href="tg://user?id={uid}">{safe_name}</a> | {uname} | <code>{uid}</code>'
-    
 
 
 # --- YORDAMCHI FUNKSIYALAR ---
